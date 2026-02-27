@@ -304,3 +304,233 @@ func (app *GameServerApp) saveGameState() {
 	// Save player data, match results, etc.
 	app.logger.Info("Saving game state...")
 }
+
+
+
+func (egs *EnhancedGameServer) handleTCPConnection(conn net.Conn) {
+	defer conn.Close()
+	
+	// Handle authentication
+	session, err := egs.connectionManager.HandleTCPAuth(conn)
+	if err != nil {
+		log.Printf("Auth failed: %v", err)
+		return
+	}
+	
+	// Create player entry
+	player := &Player{
+		ID:        session.PlayerID,
+		SessionID: session.SessionID,
+		State: &pb.PlayerState{
+			PlayerId: session.PlayerID,
+			Position: &pb.Vector3{X: 0, Y: 0, Z: 0},
+			Velocity: &pb.Vector3{X: 0, Y: 0, Z: 0},
+			Rotation: &pb.Quaternion{X: 0, Y: 0, Z: 0, W: 1},
+			Health:   100.0,
+		},
+		Connection: &PlayerConnection{
+			LastPacket: time.Now(),
+		},
+	}
+	
+	egs.players.Store(session.PlayerID, player)
+	
+	log.Printf("Player %s ready for UDP connection", session.PlayerID)
+	
+	// Keep TCP connection alive for reliable messages
+	// Handle chat, inventory, etc. here
+	egs.handleReliableMessages(session, conn)
+}
+
+func (egs *EnhancedGameServer) startUDPListener() {
+	addr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf(":%s", egs.connectionManager.udpPort))
+	conn, err := net.ListenUDP("udp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	egs.udpConn = conn
+	conn.SetReadBuffer(1024 * 1024)
+	conn.SetWriteBuffer(1024 * 1024)
+	
+	log.Printf("UDP Game server listening on :%s", egs.connectionManager.udpPort)
+	
+	buffer := make([]byte, 1400)
+	
+	for {
+		n, addr, err := conn.ReadFromUDP(buffer)
+		if err != nil {
+			continue
+		}
+		
+		go egs.handleUDPPacket(buffer[:n], addr)
+	}
+}
+
+func (egs *EnhancedGameServer) handleUDPPacket(data []byte, addr *net.UDPAddr) {
+	// Try to get existing session
+	session, exists := egs.connectionManager.GetSessionByUDP(addr)
+	
+	if !exists {
+		// This might be a handshake packet
+		session, err := egs.connectionManager.HandleUDPHandshake(data, addr)
+		if err != nil {
+			log.Printf("UDP handshake failed from %s: %v", addr, err)
+			return
+		}
+		
+		// Send handshake acknowledgment
+		egs.sendUDPHandshakeAck(addr, session)
+		return
+	}
+	
+	// Parse game packet
+	packet := &pb.GamePacket{}
+	if err := proto.Unmarshal(data, packet); err != nil {
+		return
+	}
+	
+	// Process packet based on type
+	switch packet.Type {
+	case pb.PacketType_INPUT:
+		egs.handlePlayerInput(session, packet.GetInput())
+	case pb.PacketType_PING:
+		egs.handlePing(session, addr)
+	}
+}
+
+// Enhanced broadcast with delta compression and interest management
+func (egs *EnhancedGameServer) broadcastGameState() {
+	// Collect all entities for spatial indexing
+	entities := make(map[string]*Entity)
+	egs.players.Range(func(key, value interface{}) bool {
+		player := value.(*Player)
+		entities[player.ID] = &Entity{
+			ID:       player.ID,
+			Position: player.State.Position,
+			Radius:   0.5,
+		}
+		return true
+	})
+	
+	// Update spatial index for interest management
+	egs.interestManager.UpdateSpatialIndex(entities)
+	
+	// Broadcast to each player
+	egs.players.Range(func(key, value interface{}) bool {
+		player := value.(*Player)
+		
+		// Update player's area of interest
+		egs.interestManager.UpdateInterest(player.ID, player.State.Position)
+		
+		// Get entities player is interested in
+		interestedEntities := egs.interestManager.GetInterestedEntities(player.ID)
+		
+		// Build delta update only for interested entities
+		deltas := make([]*pb.DeltaUpdate, 0, len(interestedEntities))
+		
+		for _, entityID := range interestedEntities {
+			if otherPlayer, ok := egs.players.Load(entityID); ok {
+				p := otherPlayer.(*Player)
+				
+				// Compute delta
+				delta := egs.deltaCompressor.ComputeDelta(entityID, p.State)
+				
+				// Only send if something changed
+				if delta.HasChanges() {
+					deltas = append(deltas, delta.ToProto())
+				}
+			}
+		}
+		
+		// Don't send empty updates
+		if len(deltas) == 0 {
+			return true
+		}
+		
+		// Create delta world state
+		deltaState := &pb.DeltaWorldState{
+			SnapshotId: egs.serverTick,
+			Deltas:     deltas,
+			ServerTick: egs.serverTick,
+		}
+		
+		// Send via UDP
+		egs.sendDeltaUpdate(player, deltaState)
+		
+		return true
+	})
+}
+
+func (egs *EnhancedGameServer) sendDeltaUpdate(player *Player, deltaState *pb.DeltaWorldState) {
+	if player.Connection.UDPAddr == nil {
+		return
+	}
+	
+	data, err := proto.Marshal(deltaState)
+	if err != nil {
+		return
+	}
+	
+	egs.udpConn.WriteToUDP(data, player.Connection.UDPAddr)
+}
+
+func (egs *EnhancedGameServer) cleanupDeltaCompressor() {
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		egs.deltaCompressor.Cleanup(5 * time.Minute)
+	}
+}
+
+func (egs *EnhancedGameServer) handleReliableMessages(session *Session, conn net.Conn) {
+	// Handle reliable TCP messages (chat, inventory, etc.)
+	// Keep connection open for bidirectional communication
+	
+	buffer := make([]byte, 4096)
+	for {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		
+		n, err := conn.Read(buffer)
+		if err != nil {
+			log.Printf("TCP read error for session %s: %v", session.SessionID, err)
+			egs.connectionManager.DisconnectSession(session.SessionID)
+			return
+		}
+		
+		// Process reliable message
+		// Parse and handle chat, inventory updates, etc.
+		_ = n
+	}
+}
+
+func (egs *EnhancedGameServer) sendUDPHandshakeAck(addr *net.UDPAddr, session *Session) {
+	ack := &pb.UDPHandshakeAck{
+		Success:    true,
+		ServerTick: egs.serverTick,
+	}
+	
+	data, _ := proto.Marshal(ack)
+	egs.udpConn.WriteToUDP(data, addr)
+}
+
+func (egs *EnhancedGameServer) handlePlayerInput(session *Session, input *pb.InputUpdate) {
+	playerVal, exists := egs.players.Load(session.PlayerID)
+	if !exists {
+		return
+	}
+	
+	player := playerVal.(*Player)
+	player.LastInput = input
+}
+
+func (egs *EnhancedGameServer) handlePing(session *Session, addr *net.UDPAddr) {
+	pong := &pb.GamePacket{
+		Type:    pb.PacketType_PONG,
+		Payload: &pb.GamePacket_Pong{Pong: &pb.Pong{}},
+	}
+	
+	data, _ := proto.Marshal(pong)
+	egs.udpConn.WriteToUDP(data, addr)
+}
