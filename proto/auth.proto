@@ -1,0 +1,31 @@
+syntax = "proto3";
+package game;
+option go_package = "./proto";
+
+// TCP Messages
+message AuthRequest {
+  string token = 1;
+  string player_id = 2;
+}
+
+message AuthResponse {
+  bool success = 1;
+  string session_id = 2;
+  string error = 3;
+}
+
+// UDP Messages
+message PlayerState {
+  string player_id = 1;
+  float pos_x = 2;
+  float pos_y = 3;
+  float pos_z = 4;
+  float rot_x = 5;
+  float rot_y = 6;
+  uint64 timestamp = 7;
+}
+
+message GameStateUpdate {
+  repeated PlayerState players = 1;
+  uint64 server_tick = 2;
+}

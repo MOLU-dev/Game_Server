@@ -1,0 +1,26 @@
+syntax = "proto3";
+package game;
+option go_package = "./proto";
+
+message UDPHandshake {
+  string session_id = 1;
+  string player_id = 2;
+  uint64 timestamp = 3;
+  string client_version = 4;
+}
+
+message UDPHandshakeAck {
+  bool success = 1;
+  uint64 server_tick = 2;
+  uint32 assigned_slot = 3;
+}
+
+message AuthResponse {
+  bool success = 1;
+  string session_id = 2;
+  string player_id = 3;
+  string error = 4;
+  string udp_port = 5;
+  string server_ip = 6;
+}
+*/
